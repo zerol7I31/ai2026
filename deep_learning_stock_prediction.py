@@ -35,18 +35,18 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 CONFIG = {
-    "stock_pool": "hs1000",
-    "max_stocks": 1000,
+    "stock_pool": "hs300",
+    "max_stocks": 300,
     "seq_len": 30,
     "pred_horizon": 5,
-    "batch_size": 128,
-    "epochs": 50,
-    "learning_rate": 0.0001,
-    "weight_decay": 1e-5,
-    "dropout": 0.2,
+    "batch_size": 256,
+    "epochs": 80,
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-3,
+    "dropout": 0.4,
     "hidden_size": 128,
     "num_layers": 2,
-    "embed_dim": 64,
+    "embed_dim": 16,
     "train_start": "2016-01-01",
     "train_end": "2023-12-31",
     "val_start": "2024-01-01",
@@ -60,8 +60,13 @@ CONFIG = {
     "daily_trade_n": 3,
     "competition_start": "2026-06-01",
     "competition_end": "2026-06-12",
-    "patience": 10,
+    "patience": 12,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "label_type": "cs_rank",
+    "ensemble_seeds": [42, 123, 456, 789, 2024],
+    "ic_loss_weight": 0.5,
+    "mixup_alpha": 0.2,
+    "warmup_epochs": 5,
 }
 
 print(f"Using device: {CONFIG['device']}")
@@ -319,6 +324,32 @@ def compute_features(group_df):
     df["vol_diff"] = df["vol"].diff().astype("float32")
     df["amount_diff"] = df["amount"].diff().astype("float32")
 
+    df["overnight_ret"] = ((df["open"] / df["close"].shift(1).clip(lower=1e-9)) - 1).astype("float32")
+    df["intraday_ret"] = ((df["close"] / df["open"].clip(lower=1e-9)) - 1).astype("float32")
+
+    ret_5_neg = ret.rolling(5, min_periods=3).apply(lambda x: -np.sum(x[x < 0]) if np.any(x < 0) else 0, raw=True).astype("float32")
+    ret_5_pos = ret.rolling(5, min_periods=3).apply(lambda x: np.sum(x[x > 0]) if np.any(x > 0) else 0, raw=True).astype("float32")
+    df["downside_vol_5"] = ret_5_neg
+    df["upside_vol_5"] = ret_5_pos
+
+    ret_20_sum = ret.rolling(20, min_periods=10).sum().astype("float32")
+    ret_5_sum = ret.rolling(5, min_periods=3).sum().astype("float32")
+    df["mom_rev_5_20"] = (ret_5_sum - ret_20_sum).astype("float32")
+
+    vol_ma5 = df["vol"].rolling(5, min_periods=3).mean().astype("float32")
+    vol_ma20 = df["vol"].rolling(20, min_periods=10).mean().astype("float32")
+    df["vol_ma_ratio"] = ((vol_ma5 / vol_ma20.clip(lower=1e-9)) - 1).astype("float32")
+
+    ret_10_sum = ret.rolling(10, min_periods=5).sum().astype("float32")
+    vol_10_sum = df["vol"].rolling(10, min_periods=5).sum().astype("float32")
+    df["price_vol_div_10"] = (np.sign(ret_10_sum.values) * np.sign(vol_10_sum.values - df["vol"].rolling(10, min_periods=5).mean().values) * (-1)).astype("float32")
+
+    df["max_ret_5"] = ret.rolling(5, min_periods=3).max().astype("float32")
+    df["min_ret_5"] = ret.rolling(5, min_periods=3).min().astype("float32")
+
+    df["ret_skew_20"] = ret.rolling(20, min_periods=10).skew().astype("float32")
+    df["ret_kurt_20"] = ret.rolling(20, min_periods=10).kurt().astype("float32")
+
     fwd_close = df["close"].shift(-CONFIG["pred_horizon"])
     df["label_5d"] = (fwd_close / df["close"] - 1).astype("float32")
 
@@ -339,6 +370,13 @@ def compute_features(group_df):
         "amplitude",
         "turnover",
         "pct_chg_diff", "vol_diff", "amount_diff",
+        "overnight_ret", "intraday_ret",
+        "downside_vol_5", "upside_vol_5",
+        "mom_rev_5_20",
+        "vol_ma_ratio",
+        "price_vol_div_10",
+        "max_ret_5", "min_ret_5",
+        "ret_skew_20", "ret_kurt_20",
     ]
     return df, feature_cols
 
@@ -392,6 +430,27 @@ def build_sequences(panel, feature_cols, stock_list):
     return all_sequences
 
 
+def apply_cross_sectional_rank(sequences):
+    if CONFIG.get("label_type") != "cs_rank":
+        return sequences
+
+    df = pd.DataFrame([{"idx": i, "date": s["date"], "label": s["label"]} for i, s in enumerate(sequences)])
+    df["date"] = pd.to_datetime(df["date"])
+    df["cs_rank"] = np.nan
+
+    for date_val, group in tqdm(df.groupby("date"), desc="Cross-sectional ranking"):
+        if len(group) < 5:
+            continue
+        ranks = group["label"].rank(pct=True)
+        df.loc[group.index, "cs_rank"] = ranks.values * 2 - 1
+
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Applying CS rank labels"):
+        if not np.isnan(row["cs_rank"]):
+            sequences[i]["label"] = float(row["cs_rank"])
+
+    return sequences
+
+
 class StockSequenceDataset(Dataset):
     def __init__(self, sequences, code_to_id):
         self.sequences = sequences
@@ -416,25 +475,32 @@ class StockGRUModel(nn.Module):
     def __init__(self, input_dim, hidden_size, num_layers, dropout, num_stocks, embed_dim):
         super().__init__()
         self.stock_embedding = nn.Embedding(num_stocks, embed_dim)
+        self.input_proj = nn.Linear(input_dim, hidden_size)
+        self.input_norm = nn.LayerNorm(hidden_size)
         self.gru = nn.GRU(
-            input_dim, hidden_size, num_layers,
+            hidden_size, hidden_size, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0,
             bidirectional=True,
         )
         self.gru_norm = nn.LayerNorm(hidden_size * 2)
-        self.attention = nn.Sequential(
+        self.attn1 = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+        self.attn2 = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.Tanh(),
             nn.Linear(hidden_size, 1),
         )
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2 + embed_dim, hidden_size),
+            nn.Linear(hidden_size * 4 + embed_dim, hidden_size),
             nn.LayerNorm(hidden_size),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size // 2),
             nn.LayerNorm(hidden_size // 2),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, 1),
         )
@@ -459,29 +525,69 @@ class StockGRUModel(nn.Module):
                 nn.init.zeros_(param)
 
     def forward(self, x, stock_ids):
-        gru_out, _ = self.gru(x)
+        x_proj = self.input_proj(x)
+        x_proj = self.input_norm(x_proj)
+        x_proj = torch.nn.functional.gelu(x_proj)
+        gru_out, _ = self.gru(x_proj)
         gru_out = self.gru_norm(gru_out)
-        attn_weights = self.attention(gru_out)
-        attn_weights = torch.softmax(attn_weights, dim=1)
-        context = torch.sum(attn_weights * gru_out, dim=1)
+        attn1_w = torch.softmax(self.attn1(gru_out), dim=1)
+        ctx1 = torch.sum(attn1_w * gru_out, dim=1)
+        attn2_w = torch.softmax(self.attn2(gru_out), dim=1)
+        ctx2 = torch.sum(attn2_w * gru_out, dim=1)
+        multi_ctx = torch.cat([ctx1, ctx2], dim=1)
         stock_emb = self.stock_embedding(stock_ids)
-        combined = torch.cat([context, stock_emb], dim=1)
+        combined = torch.cat([multi_ctx, stock_emb], dim=1)
         output = self.fc(combined)
         return output.squeeze(-1)
+
+
+def list_mle_loss(preds, labels):
+    _, indices = torch.sort(labels, descending=True)
+    sorted_preds = preds[indices]
+    log_cumsum = torch.logcumsumexp(sorted_preds.flip(0), dim=0).flip(0)
+    return (log_cumsum - sorted_preds).mean()
+
+
+def pearson_ic_loss(preds, labels):
+    pred_mean = preds.mean()
+    label_mean = labels.mean()
+    pred_centered = preds - pred_mean
+    label_centered = labels - label_mean
+    cov = (pred_centered * label_centered).mean()
+    pred_std = torch.sqrt((pred_centered ** 2).mean() + 1e-8)
+    label_std = torch.sqrt((label_centered ** 2).mean() + 1e-8)
+    pearson_r = cov / (pred_std * label_std + 1e-8)
+    return 1.0 - pearson_r
+
+
+def combined_loss(preds, labels):
+    huber = nn.functional.huber_loss(preds, labels, delta=0.2)
+    ic_loss = pearson_ic_loss(preds, labels)
+    ic_weight = CONFIG.get("ic_loss_weight", 0.5)
+    return (1.0 - ic_weight) * huber + ic_weight * ic_loss
 
 
 def train_model(model, train_loader, val_loader, save_path):
     device = CONFIG["device"]
     model = model.to(device)
 
-    criterion = nn.HuberLoss(delta=1.0)
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["learning_rate"], weight_decay=CONFIG["weight_decay"])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    warmup_epochs = CONFIG.get("warmup_epochs", 5)
+    total_epochs = CONFIG["epochs"]
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[
+            optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs),
+            optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-6),
+        ],
+        milestones=[warmup_epochs],
+    )
 
     best_val_loss = float("inf")
     patience_counter = 0
     train_losses = []
     val_losses = []
+    mixup_alpha = CONFIG.get("mixup_alpha", 0.0)
 
     for epoch in range(CONFIG["epochs"]):
         model.train()
@@ -490,15 +596,26 @@ def train_model(model, train_loader, val_loader, save_path):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{CONFIG['epochs']} Train")
         for features, labels, stock_ids, _ in pbar:
             features, labels, stock_ids = features.to(device), labels.to(device), stock_ids.to(device)
+
+            if mixup_alpha > 0 and epoch >= warmup_epochs:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                if lam < 0.5:
+                    lam = 1.0 - lam
+                perm = torch.randperm(features.size(0), device=features.device)
+                features = lam * features + (1 - lam) * features[perm]
+                labels = lam * labels + (1 - lam) * labels[perm]
+
             optimizer.zero_grad()
             preds = model(features, stock_ids)
-            loss = criterion(preds, labels)
+            loss = combined_loss(preds, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
             batch_count += 1
-            pbar.set_postfix({"loss": loss.item()})
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        scheduler.step()
 
         avg_train_loss = total_loss / max(batch_count, 1)
         train_losses.append(avg_train_loss)
@@ -510,15 +627,14 @@ def train_model(model, train_loader, val_loader, save_path):
             for features, labels, stock_ids, _ in val_loader:
                 features, labels, stock_ids = features.to(device), labels.to(device), stock_ids.to(device)
                 preds = model(features, stock_ids)
-                loss = criterion(preds, labels)
+                loss = combined_loss(preds, labels)
                 total_val_loss += loss.item()
                 val_batch_count += 1
         avg_val_loss = total_val_loss / max(val_batch_count, 1)
         val_losses.append(avg_val_loss)
 
-        print(f"Epoch {epoch + 1}: Train Loss={avg_train_loss:.6f}, Val Loss={avg_val_loss:.6f}")
-
-        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch + 1}: Train Loss={avg_train_loss:.6f}, Val Loss={avg_val_loss:.6f}, LR={current_lr:.2e}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -585,12 +701,14 @@ def compute_direction_accuracy(predictions, labels):
 
 def build_prices_pivot(panel, stock_pool):
     sub = panel[panel["ts_code"].isin(stock_pool)].copy()
-    piv = sub.pivot_table(index="trade_date", columns="ts_code", values="close", aggfunc="last")
-    piv = piv.sort_index()
-    return piv
+    close_piv = sub.pivot_table(index="trade_date", columns="ts_code", values="close", aggfunc="last")
+    close_piv = close_piv.sort_index()
+    open_piv = sub.pivot_table(index="trade_date", columns="ts_code", values="open", aggfunc="first")
+    open_piv = open_piv.sort_index()
+    return close_piv, open_piv
 
 
-def backtest_strategy(prices_pivot, predictions_df, cal_df):
+def backtest_strategy(prices_pivot, open_pivot, predictions_df, cal_df):
     cash = CONFIG["initial_capital"]
     holdings = {}
     daily_values = []
@@ -614,11 +732,12 @@ def backtest_strategy(prices_pivot, predictions_df, cal_df):
     for idx_t, date_val in enumerate(tqdm(all_dates, desc="Backtest")):
         if date_val not in prices_pivot.index:
             continue
-        price_row = prices_pivot.loc[date_val]
+        close_row = prices_pivot.loc[date_val]
+        open_row = open_pivot.loc[date_val] if date_val in open_pivot.index else None
 
         for code in list(holdings.keys()):
-            if code in price_row.index and pd.notna(price_row[code]):
-                holdings[code]["current_price"] = float(price_row[code])
+            if code in close_row.index and pd.notna(close_row[code]):
+                holdings[code]["current_price"] = float(close_row[code])
 
         scores = pd.Series(dtype=float)
         if date_val in shifted_preds.index:
@@ -656,7 +775,7 @@ def backtest_strategy(prices_pivot, predictions_df, cal_df):
         open_slots = top_n - len(holdings)
         to_buy = to_buy[:open_slots] if open_slots > 0 else []
 
-        if to_buy and cash > 0:
+        if to_buy and cash > 0 and open_row is not None:
             buy_scores_raw = np.array([scores.get(c, 0.0) for c in to_buy], dtype=np.float64)
             if len(buy_scores_raw) > 1:
                 buy_scores_centered = buy_scores_raw - buy_scores_raw.mean()
@@ -665,9 +784,9 @@ def backtest_strategy(prices_pivot, predictions_df, cal_df):
             else:
                 buy_weights = np.ones(1)
             for j, code in enumerate(to_buy):
-                if code not in price_row.index or pd.isna(price_row[code]):
+                if code not in open_row.index or pd.isna(open_row[code]):
                     continue
-                bp = float(price_row[code]) * (1 + slip)
+                bp = float(open_row[code]) * (1 + slip)
                 if not np.isfinite(bp) or bp <= 0:
                     continue
                 alloc = cash * float(buy_weights[j])
@@ -682,7 +801,8 @@ def backtest_strategy(prices_pivot, predictions_df, cal_df):
                     cost = shares * bp * (1 + comm)
                 cash -= cost
                 holdings[code] = {"shares": shares, "buy_price": bp,
-                                  "current_price": bp, "bought_at_tidx": idx_t}
+                                  "current_price": float(close_row[code]) if code in close_row.index and pd.notna(close_row[code]) else bp,
+                                  "bought_at_tidx": idx_t}
 
         total_value = cash + sum(h["shares"] * h.get("current_price", h["buy_price"]) for h in holdings.values())
         daily_values.append({"date": date_val, "value": total_value, "cash": cash})
@@ -945,6 +1065,9 @@ def main():
     sequences = build_sequences(panel, feature_cols, stock_pool)
     print(f"  Total sequences: {len(sequences):,}")
 
+    print("  Applying cross-sectional rank normalization to labels...")
+    sequences = apply_cross_sectional_rank(sequences)
+
     train_start = pd.to_datetime(CONFIG["train_start"])
     train_end = pd.to_datetime(CONFIG["train_end"])
     val_start = pd.to_datetime(CONFIG["val_start"])
@@ -968,20 +1091,20 @@ def main():
     val_dataset = StockSequenceDataset(val_seq, code_to_id) if val_seq else None
     test_dataset = StockSequenceDataset(test_seq, code_to_id) if test_seq else None
 
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=0, pin_memory=False)
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=0, pin_memory=False) if val_dataset else None
     test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=0, pin_memory=False) if test_dataset else None
 
     input_dim = train_dataset.features.shape[2]
 
-    print("\n[7/9] Training ensemble of 3 GRU models (seeds: 42, 123, 456)...")
+    ensemble_seeds = CONFIG.get("ensemble_seeds", [42])
+    print(f"\n[7/9] Training ensemble of {len(ensemble_seeds)} GRU models (seeds: {ensemble_seeds})...")
     input_dim = train_dataset.features.shape[2]
-    ensemble_seeds = [42, 123, 456]
     ensemble_models = []
 
     for si, seed in enumerate(ensemble_seeds):
         set_seed(seed)
-        print(f"\n  --- Model {si + 1}/3 (seed={seed}) ---")
+        print(f"\n  --- Model {si + 1}/{len(ensemble_seeds)} (seed={seed}) ---")
 
         model = StockGRUModel(
             input_dim=input_dim,
@@ -1033,6 +1156,28 @@ def main():
     val_preds, val_labels, val_dates = ensemble_predict(val_loader, val_seq) if val_seq else (np.array([]), np.array([]), [])
     test_preds, test_labels, test_dates = ensemble_predict(test_loader, test_seq) if test_seq else (np.array([]), np.array([]), [])
 
+    def cross_sectional_normalize(preds, dates):
+        df = pd.DataFrame({"pred": preds, "date": dates})
+        df["date"] = pd.to_datetime(df["date"])
+        df["pred_cs_norm"] = np.nan
+        for date_val, group in df.groupby("date"):
+            if len(group) < 5:
+                df.loc[group.index, "pred_cs_norm"] = group["pred"]
+                continue
+            vals = group["pred"].values
+            mu = np.mean(vals)
+            sigma = np.std(vals)
+            if sigma < 1e-9:
+                df.loc[group.index, "pred_cs_norm"] = 0.0
+            else:
+                df.loc[group.index, "pred_cs_norm"] = (vals - mu) / sigma
+        return df["pred_cs_norm"].values
+
+    if len(val_preds) > 0:
+        val_preds = cross_sectional_normalize(val_preds, val_dates)
+    if len(test_preds) > 0:
+        test_preds = cross_sectional_normalize(test_preds, test_dates)
+
     eval_data = []
     for name, preds, labels, dates in [("Validation", val_preds, val_labels, val_dates), ("Test", test_preds, test_labels, test_dates)]:
         if len(preds) == 0:
@@ -1069,9 +1214,9 @@ def main():
     )
 
     print("  Building price pivot for vectorized backtest...")
-    prices_pivot = build_prices_pivot(panel, stock_pool)
+    prices_pivot, open_pivot = build_prices_pivot(panel, stock_pool)
 
-    daily_values, trade_dates = backtest_strategy(prices_pivot, predictions_pivot, cal_df)
+    daily_values, trade_dates = backtest_strategy(prices_pivot, open_pivot, predictions_pivot, cal_df)
     if daily_values:
         bt_df = pd.DataFrame(daily_values).sort_values("date")
         bt_df.to_csv(os.path.join(OUTPUT_DIR, "backtest_daily_values.csv"), index=False, encoding="utf-8-sig")
