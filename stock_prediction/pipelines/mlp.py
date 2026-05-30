@@ -137,6 +137,13 @@ def main(config=None):
         num_workers=0,
         pin_memory=False,
     )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
     val_loader = (
         DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=0, pin_memory=False)
         if val_dataset
@@ -174,7 +181,7 @@ def main(config=None):
     device = config["device"]
     model.eval()
 
-    train_preds, train_labels, train_dates = predict_mlp(model, train_loader, train_seq, device)
+    train_preds, train_labels, train_dates = predict_mlp(model, train_eval_loader, train_seq, device)
     val_preds, val_labels, val_dates = (
         predict_mlp(model, val_loader, val_seq, device)
         if val_seq
