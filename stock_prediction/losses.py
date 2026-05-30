@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def ranknet_loss(preds, labels, device):
@@ -10,10 +11,7 @@ def ranknet_loss(preds, labels, device):
     labels_diff = labels.unsqueeze(1) - labels.unsqueeze(0)
     label_gt = (labels_diff > 0).float()
     label_lt = (labels_diff < 0).float()
-    loss_matrix = (
-        label_gt * torch.log(1 + torch.exp(-preds_diff))
-        + label_lt * torch.log(1 + torch.exp(preds_diff))
-    )
+    loss_matrix = label_gt * F.softplus(-preds_diff) + label_lt * F.softplus(preds_diff)
     denom = (label_gt.sum() + label_lt.sum()).clamp_min(1.0)
     return loss_matrix.sum() / denom
 
@@ -45,4 +43,3 @@ def combined_loss(preds, labels, ic_loss_weight=0.5):
     huber = nn.functional.huber_loss(preds, labels, delta=0.2)
     ic_loss = pearson_ic_loss(preds, labels)
     return (1.0 - ic_loss_weight) * huber + ic_loss_weight * ic_loss
-

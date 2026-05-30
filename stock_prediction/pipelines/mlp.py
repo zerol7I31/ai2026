@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from stock_prediction.backtest import (
     align_benchmark_to_backtest,
     backtest_strategy,
-    build_close_prices_pivot,
+    build_price_pivots,
     compute_backtest_metrics,
     plot_backtest_curve,
 )
@@ -35,11 +35,13 @@ from stock_prediction.features import (
 )
 from stock_prediction.models import MLPSequenceDataset, MLPStockPredictor
 from stock_prediction.sequences import (
+    apply_cross_sectional_rank,
     build_mlp_sequences,
+    filter_sequences_by_trade_period,
     filter_features_by_idx,
-    select_features_rf,
+    select_mlp_features,
 )
-from stock_prediction.settings import MLP_CONFIG, OUTPUT_DIR
+from stock_prediction.settings import MLP_CONFIG, MLP_OUTPUT_DIR
 from stock_prediction.signals import (
     generate_mlp_competition_signals,
     print_competition_summary,
@@ -51,7 +53,8 @@ from stock_prediction.utils import set_seed
 
 def main(config=None):
     config = config or MLP_CONFIG
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = config.get("output_dir", MLP_OUTPUT_DIR)
+    os.makedirs(output_dir, exist_ok=True)
     warnings.filterwarnings("ignore")
     set_seed(42)
 
@@ -87,35 +90,37 @@ def main(config=None):
     )
     print(f"  Feature columns ({len(feature_cols)} dims): {feature_cols}")
 
-    print("\n[5/9] Normalizing features (expanding per-stock, no lookahead)...")
-    panel = normalize_features(panel, feature_cols, mode="expanding")
+    normalize_mode = config.get("normalize_mode", "rolling_252")
+    print(f"\n[5/9] Normalizing features ({normalize_mode}, no lookahead)...")
+    panel = normalize_features(panel, feature_cols, mode=normalize_mode)
 
     print("\n[6/9] Building MLP sequences (flatten window -> 1D vector)...")
     sequences = build_mlp_sequences(panel, feature_cols, stock_pool, config)
     print(f"  Total sequences: {len(sequences):,}")
+
+    if config.get("label_type") == "cs_rank":
+        print("  Applying cross-sectional rank normalization to labels...")
+        sequences = apply_cross_sectional_rank(sequences, enabled=True)
+
     feat_dim = len(sequences[0]["features"]) if sequences else 0
     print(
         f"  Feature dimension (seq_len x n_features = "
         f"{config['seq_len']} x {len(feature_cols)} = {feat_dim})"
     )
 
-    train_start = pd.to_datetime(config["train_start"])
-    train_end = pd.to_datetime(config["train_end"])
-    val_start = pd.to_datetime(config["val_start"])
-    val_end = pd.to_datetime(config["val_end"])
-    test_start = pd.to_datetime(config["test_start"])
-
-    train_seq = [s for s in sequences if train_start <= s["date"] <= train_end]
-    val_seq = [s for s in sequences if val_start <= s["date"] <= val_end]
-    test_seq = [s for s in sequences if s["date"] >= test_start]
+    train_seq = filter_sequences_by_trade_period(sequences, config["train_start"], config["train_end"])
+    val_seq = filter_sequences_by_trade_period(sequences, config["val_start"], config["val_end"])
+    test_seq = filter_sequences_by_trade_period(sequences, config["test_start"], config["test_end"])
     print(f"  Train: {len(train_seq):,}, Val: {len(val_seq):,}, Test: {len(test_seq):,}")
 
     if len(train_seq) == 0:
         print("ERROR: No training sequences! Check date ranges.")
         sys.exit(1)
 
-    print("\n  Random Forest feature selection...")
-    selected_idx = select_features_rf(train_seq, n_top=min(100, feat_dim))
+    feature_selection = config.get("feature_selection", "corr")
+    n_top = min(config.get("feature_selection_top_k", 100), feat_dim)
+    print(f"\n  MLP feature selection ({feature_selection})...")
+    selected_idx = select_mlp_features(train_seq, n_top=n_top, method=feature_selection)
 
     train_seq = filter_features_by_idx(train_seq, selected_idx)
     val_seq = filter_features_by_idx(val_seq, selected_idx) if val_seq else []
@@ -128,7 +133,7 @@ def main(config=None):
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
         pin_memory=False,
     )
@@ -156,12 +161,12 @@ def main(config=None):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Total parameters: {total_params:,}")
 
-    model_path = os.path.join(OUTPUT_DIR, "mlp_best_model.pth")
+    model_path = os.path.join(output_dir, "best_model.pth")
     if val_loader is not None:
-        train_mlp_model(model, train_loader, val_loader, model_path, config, OUTPUT_DIR)
+        train_mlp_model(model, train_loader, val_loader, model_path, config, output_dir)
     else:
         print("  No validation set, training without validation...")
-        train_mlp_model(model, train_loader, train_loader, model_path, config, OUTPUT_DIR)
+        train_mlp_model(model, train_loader, train_loader, model_path, config, output_dir)
 
     model.load_state_dict(torch.load(model_path, map_location=config["device"], weights_only=True))
 
@@ -169,6 +174,7 @@ def main(config=None):
     device = config["device"]
     model.eval()
 
+    train_preds, train_labels, train_dates = predict_mlp(model, train_loader, train_seq, device)
     val_preds, val_labels, val_dates = (
         predict_mlp(model, val_loader, val_seq, device)
         if val_seq
@@ -182,6 +188,7 @@ def main(config=None):
 
     eval_data = []
     for name, preds, labels, dates in [
+        ("Train", train_preds, train_labels, train_dates),
         ("Validation", val_preds, val_labels, val_dates),
         ("Test", test_preds, test_labels, test_dates),
     ]:
@@ -205,14 +212,14 @@ def main(config=None):
         )
 
     eval_df = pd.DataFrame(eval_data)
-    eval_df.to_csv(os.path.join(OUTPUT_DIR, "mlp_evaluation_metrics.csv"), index=False, encoding="utf-8-sig")
+    eval_df.to_csv(os.path.join(output_dir, "evaluation_metrics.csv"), index=False, encoding="utf-8-sig")
     print("\n" + eval_df.to_string(index=False))
 
     print("\n[9/9] Running backtest...")
     all_predictions = [
         {
             "ts_code": sequence["ts_code"],
-            "date": sequence["date"],
+            "date": sequence.get("trade_date", sequence["date"]),
             "prediction": float(test_preds[i]),
         }
         for i, sequence in enumerate(test_seq)
@@ -226,13 +233,18 @@ def main(config=None):
     )
 
     print("  Building price pivot for backtest...")
-    prices_pivot = build_close_prices_pivot(panel, stock_pool)
+    prices_pivot, open_pivot = build_price_pivots(panel, stock_pool)
 
-    daily_values, _ = backtest_strategy(prices_pivot, predictions_pivot, config)
+    daily_values, _ = backtest_strategy(prices_pivot, predictions_pivot, config, open_pivot=open_pivot)
     if daily_values:
         bt_df = pd.DataFrame(daily_values).sort_values("date")
-        bt_df.to_csv(os.path.join(OUTPUT_DIR, "mlp_backtest_daily_values.csv"), index=False, encoding="utf-8-sig")
-        metrics = compute_backtest_metrics(bt_df)
+        bt_df.to_csv(os.path.join(output_dir, "backtest_daily_values.csv"), index=False, encoding="utf-8-sig")
+        metrics = compute_backtest_metrics(bt_df, initial_capital=config["initial_capital"])
+        pd.DataFrame([metrics]).to_csv(
+            os.path.join(output_dir, "backtest_metrics.csv"),
+            index=False,
+            encoding="utf-8-sig",
+        )
         print("\nBacktest Metrics:")
         for key, value in metrics.items():
             print(f"  {key}: {value}")
@@ -243,9 +255,10 @@ def main(config=None):
             bt_df,
             bench_df,
             "MLP Strategy vs CSI300 Benchmark",
-            "mlp_backtest_curve.png",
-            OUTPUT_DIR,
+            "backtest_curve.png",
+            output_dir,
             strategy_label="MLP Strategy",
+            initial_capital=config["initial_capital"],
         )
     else:
         print("  No backtest data generated.")
@@ -261,10 +274,10 @@ def main(config=None):
         config,
     )
     if len(comp_signals) > 0:
-        comp_signals.to_csv(os.path.join(OUTPUT_DIR, "mlp_competition_signals.csv"), index=False, encoding="utf-8-sig")
+        comp_signals.to_csv(os.path.join(output_dir, "competition_signals.csv"), index=False, encoding="utf-8-sig")
         print_competition_summary(comp_signals)
         trades_df = summarize_daily_trades(comp_signals)
-        trades_df.to_csv(os.path.join(OUTPUT_DIR, "mlp_competition_daily_trades.csv"), index=False, encoding="utf-8-sig")
+        trades_df.to_csv(os.path.join(output_dir, "competition_daily_trades.csv"), index=False, encoding="utf-8-sig")
         print("\n" + trades_df.to_string(index=False))
     else:
         print("  No competition signals generated (check data availability for 2026.6).")
@@ -275,10 +288,10 @@ def main(config=None):
         "feature_cols": feature_cols,
         "selected_idx": selected_idx,
         "input_dim": input_dim,
-    }, os.path.join(OUTPUT_DIR, "mlp_model_checkpoint.pth"))
+    }, os.path.join(output_dir, "model_checkpoint.pth"))
 
     print("\n" + "=" * 60)
-    print(f"All MLP results saved to: {OUTPUT_DIR}")
+    print(f"All MLP results saved to: {output_dir}")
     print("=" * 60)
 
 

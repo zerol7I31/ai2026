@@ -35,8 +35,12 @@ from stock_prediction.features import (
     normalize_features,
 )
 from stock_prediction.models import StockGRUModel, StockSequenceDataset
-from stock_prediction.sequences import apply_cross_sectional_rank, build_gru_sequences
-from stock_prediction.settings import GRU_CONFIG, OUTPUT_DIR
+from stock_prediction.sequences import (
+    apply_cross_sectional_rank,
+    build_gru_sequences,
+    filter_sequences_by_trade_period,
+)
+from stock_prediction.settings import GRU_CONFIG, GRU_OUTPUT_DIR
 from stock_prediction.signals import (
     generate_gru_competition_signals,
     print_competition_summary,
@@ -48,7 +52,8 @@ from stock_prediction.utils import set_seed
 
 def main(config=None):
     config = config or GRU_CONFIG
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = config.get("output_dir", GRU_OUTPUT_DIR)
+    os.makedirs(output_dir, exist_ok=True)
     warnings.filterwarnings("ignore")
 
     print("=" * 60)
@@ -88,7 +93,7 @@ def main(config=None):
     print("\n[5/9] Normalizing features (rolling per-stock, no lookahead)...")
     panel = normalize_features(panel, feature_cols, mode="rolling_252")
 
-    print("\n[6/9] Building sequences (label: 5-day average forward return)...")
+    print("\n[6/9] Building sequences (label: forward return over prediction horizon)...")
     sequences = build_gru_sequences(panel, feature_cols, stock_pool, config)
     print(f"  Total sequences: {len(sequences):,}")
 
@@ -98,15 +103,9 @@ def main(config=None):
         enabled=config.get("label_type") == "cs_rank",
     )
 
-    train_start = pd.to_datetime(config["train_start"])
-    train_end = pd.to_datetime(config["train_end"])
-    val_start = pd.to_datetime(config["val_start"])
-    val_end = pd.to_datetime(config["val_end"])
-    test_start = pd.to_datetime(config["test_start"])
-
-    train_seq = [s for s in sequences if train_start <= s["date"] <= train_end]
-    val_seq = [s for s in sequences if val_start <= s["date"] <= val_end]
-    test_seq = [s for s in sequences if s["date"] >= test_start]
+    train_seq = filter_sequences_by_trade_period(sequences, config["train_start"], config["train_end"])
+    val_seq = filter_sequences_by_trade_period(sequences, config["val_start"], config["val_end"])
+    test_seq = filter_sequences_by_trade_period(sequences, config["test_start"], config["test_end"])
     print(f"  Train: {len(train_seq):,}, Val: {len(val_seq):,}, Test: {len(test_seq):,}")
 
     if len(train_seq) == 0:
@@ -125,6 +124,13 @@ def main(config=None):
         train_dataset,
         batch_size=config["batch_size"],
         shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+    )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
         num_workers=0,
         pin_memory=False,
     )
@@ -160,12 +166,12 @@ def main(config=None):
         total_params = sum(p.numel() for p in model.parameters())
         print(f"  Total parameters: {total_params:,}")
 
-        model_path = os.path.join(OUTPUT_DIR, f"best_model_seed{seed}.pth")
+        model_path = os.path.join(output_dir, f"best_model_seed{seed}.pth")
         if val_loader is not None:
-            train_gru_model(model, train_loader, val_loader, model_path, config, OUTPUT_DIR)
+            train_gru_model(model, train_loader, val_loader, model_path, config, output_dir)
         else:
             print("  No validation set, training without validation...")
-            train_gru_model(model, train_loader, train_loader, model_path, config, OUTPUT_DIR)
+            train_gru_model(model, train_loader, train_loader, model_path, config, output_dir)
 
         model.load_state_dict(torch.load(model_path, map_location=config["device"], weights_only=True))
         model.eval()
@@ -176,6 +182,12 @@ def main(config=None):
     print("\n[8/9] Evaluating ensemble...")
     device = config["device"]
 
+    train_preds, train_labels, train_dates = ensemble_predict_gru(
+        ensemble_models,
+        train_eval_loader,
+        train_seq,
+        device,
+    )
     val_preds, val_labels, val_dates = (
         ensemble_predict_gru(ensemble_models, val_loader, val_seq, device)
         if val_seq
@@ -187,6 +199,8 @@ def main(config=None):
         else (np.array([]), np.array([]), [])
     )
 
+    if len(train_preds) > 0:
+        train_preds = cross_sectional_normalize(train_preds, train_dates)
     if len(val_preds) > 0:
         val_preds = cross_sectional_normalize(val_preds, val_dates)
     if len(test_preds) > 0:
@@ -194,6 +208,7 @@ def main(config=None):
 
     eval_data = []
     for name, preds, labels, dates in [
+        ("Train", train_preds, train_labels, train_dates),
         ("Validation", val_preds, val_labels, val_dates),
         ("Test", test_preds, test_labels, test_dates),
     ]:
@@ -217,14 +232,14 @@ def main(config=None):
         )
 
     eval_df = pd.DataFrame(eval_data)
-    eval_df.to_csv(os.path.join(OUTPUT_DIR, "evaluation_metrics.csv"), index=False, encoding="utf-8-sig")
+    eval_df.to_csv(os.path.join(output_dir, "evaluation_metrics.csv"), index=False, encoding="utf-8-sig")
     print(eval_df.to_string(index=False))
 
     print("\n[9/9] Running backtest...")
     all_predictions = [
         {
             "ts_code": sequence["ts_code"],
-            "date": sequence["date"],
+            "date": sequence.get("trade_date", sequence["date"]),
             "prediction": float(test_preds[i]),
         }
         for i, sequence in enumerate(test_seq)
@@ -243,8 +258,13 @@ def main(config=None):
     daily_values, _ = backtest_strategy(prices_pivot, predictions_pivot, config, open_pivot=open_pivot)
     if daily_values:
         bt_df = pd.DataFrame(daily_values).sort_values("date")
-        bt_df.to_csv(os.path.join(OUTPUT_DIR, "backtest_daily_values.csv"), index=False, encoding="utf-8-sig")
-        metrics = compute_backtest_metrics(bt_df)
+        bt_df.to_csv(os.path.join(output_dir, "backtest_daily_values.csv"), index=False, encoding="utf-8-sig")
+        metrics = compute_backtest_metrics(bt_df, initial_capital=config["initial_capital"])
+        pd.DataFrame([metrics]).to_csv(
+            os.path.join(output_dir, "backtest_metrics.csv"),
+            index=False,
+            encoding="utf-8-sig",
+        )
         print("\nBacktest Metrics:")
         for key, value in metrics.items():
             print(f"  {key}: {value}")
@@ -256,8 +276,9 @@ def main(config=None):
             bench_df,
             "Strategy vs Benchmark",
             "backtest_curve.png",
-            OUTPUT_DIR,
+            output_dir,
             strategy_label="Strategy",
+            initial_capital=config["initial_capital"],
         )
     else:
         print("  No backtest data generated.")
@@ -273,10 +294,10 @@ def main(config=None):
         config,
     )
     if len(comp_signals) > 0:
-        comp_signals.to_csv(os.path.join(OUTPUT_DIR, "competition_signals.csv"), index=False, encoding="utf-8-sig")
+        comp_signals.to_csv(os.path.join(output_dir, "competition_signals.csv"), index=False, encoding="utf-8-sig")
         print_competition_summary(comp_signals)
         trades_df = summarize_daily_trades(comp_signals)
-        trades_df.to_csv(os.path.join(OUTPUT_DIR, "competition_daily_trades.csv"), index=False, encoding="utf-8-sig")
+        trades_df.to_csv(os.path.join(output_dir, "competition_daily_trades.csv"), index=False, encoding="utf-8-sig")
         print("\n" + trades_df.to_string(index=False))
     else:
         print("  No competition signals generated (check data availability for 2026.6).")
@@ -288,10 +309,10 @@ def main(config=None):
         "input_dim": input_dim,
         "code_to_id": code_to_id,
         "ensemble_seeds": ensemble_seeds,
-    }, os.path.join(OUTPUT_DIR, "ensemble_checkpoint.pth"))
+    }, os.path.join(output_dir, "ensemble_checkpoint.pth"))
 
     print("\n" + "=" * 60)
-    print(f"All results saved to: {OUTPUT_DIR}")
+    print(f"All results saved to: {output_dir}")
     print("=" * 60)
 
 

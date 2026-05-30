@@ -154,8 +154,11 @@ def compute_features(
             "ret_kurt_20",
         ])
 
-    fwd_close = df["close"].shift(-pred_horizon)
-    df[label_col] = (fwd_close / df["close"] - 1).astype("float32")
+    label_start_close = df["close"].shift(-1)
+    label_end_close = df["close"].shift(-(pred_horizon + 1))
+    df["label_start_date"] = df["trade_date"].shift(-1)
+    df["label_end_date"] = df["trade_date"].shift(-(pred_horizon + 1))
+    df[label_col] = (label_end_close / label_start_close - 1).astype("float32")
     return df, feature_cols
 
 
@@ -164,8 +167,8 @@ def compute_mlp_features(group_df, config):
         group_df,
         pred_horizon=config["pred_horizon"],
         label_col="label",
-        include_ma_5_10=True,
-        include_enhanced=False,
+        include_ma_5_10=config.get("include_ma_5_10", False),
+        include_enhanced=config.get("feature_set") == "enhanced",
     )
 
 
@@ -174,8 +177,8 @@ def compute_gru_features(group_df, config):
         group_df,
         pred_horizon=config["pred_horizon"],
         label_col="label_5d",
-        include_ma_5_10=False,
-        include_enhanced=True,
+        include_ma_5_10=config.get("include_ma_5_10", False),
+        include_enhanced=config.get("feature_set") == "enhanced",
     )
 
 

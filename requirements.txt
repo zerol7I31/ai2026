@@ -1,0 +1,6 @@
+numpy
+pandas
+# torch # torch需要自己选择合适的版本
+scikit-learn
+matplotlib
+tqdm

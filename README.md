@@ -8,6 +8,8 @@ python deep_learning_stock_prediction.py
 python mlp_baseline.py
 ```
 
+默认数据目录为 `data/A股数据/`，输出目录为 `outputs/gru/` 和 `outputs/mlp/`。
+
 代码已拆分到 `stock_prediction/`：
 
 - `settings.py`：路径、数据列类型、MLP/GRU 配置

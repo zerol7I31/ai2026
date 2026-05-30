@@ -40,7 +40,6 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
     slip = config["slippage"]
     min_hold_tdays = 5
 
-    shifted_preds = predictions_df.shift(1)
     stock_universe = set(prices_pivot.columns)
 
     for idx_t, date_val in enumerate(tqdm(all_dates, desc="Backtest")):
@@ -48,20 +47,27 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
             continue
         close_row = prices_pivot.loc[date_val]
         use_open_price = open_pivot is not None and date_val in open_pivot.index
-        buy_row = close_row
+        trade_row = close_row
         if use_open_price:
-            buy_row = open_pivot.loc[date_val]
-
-        for code in list(holdings.keys()):
-            if code in close_row.index and pd.notna(close_row[code]):
-                holdings[code]["current_price"] = float(close_row[code])
+            trade_row = open_pivot.loc[date_val]
 
         scores = pd.Series(dtype=float)
-        if date_val in shifted_preds.index:
-            row = shifted_preds.loc[date_val].dropna()
+        if date_val in predictions_df.index:
+            row = predictions_df.loc[date_val].dropna()
             if len(row) > 0:
                 scores = row.sort_values(ascending=False)
                 scores = scores[scores.index.isin(stock_universe)]
+
+        if scores.empty:
+            for code in list(holdings.keys()):
+                if code in close_row.index and pd.notna(close_row[code]):
+                    holdings[code]["current_price"] = float(close_row[code])
+            total_value = cash + sum(
+                holding["shares"] * holding.get("current_price", holding["buy_price"])
+                for holding in holdings.values()
+            )
+            daily_values.append({"date": date_val, "value": total_value, "cash": cash})
+            continue
 
         current_held = set(holdings.keys())
         target_stocks = set(scores.head(top_n).index.tolist())
@@ -80,7 +86,10 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
             if code not in holdings:
                 continue
             holding = holdings[code]
-            price = holding.get("current_price", holding["buy_price"])
+            if code in trade_row.index and pd.notna(trade_row[code]):
+                price = float(trade_row[code])
+            else:
+                price = holding.get("current_price", holding["buy_price"])
             if not np.isfinite(price) or price <= 0:
                 continue
             sell_value = holding["shares"] * price * (1 - slip) * (1 - comm)
@@ -95,7 +104,7 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
         open_slots = top_n - len(holdings)
         to_buy = to_buy[:open_slots] if open_slots > 0 else []
 
-        if to_buy and cash > 0 and buy_row is not None:
+        if to_buy and cash > 0 and trade_row is not None:
             buy_scores_raw = np.array([scores.get(code, 0.0) for code in to_buy], dtype=np.float64)
             if len(buy_scores_raw) > 1:
                 buy_scores_centered = buy_scores_raw - buy_scores_raw.mean()
@@ -104,13 +113,14 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
             else:
                 buy_weights = np.ones(1)
 
+            available_cash = cash
             for j, code in enumerate(to_buy):
-                if code not in buy_row.index or pd.isna(buy_row[code]):
+                if code not in trade_row.index or pd.isna(trade_row[code]):
                     continue
-                bp = float(buy_row[code]) * (1 + slip)
+                bp = float(trade_row[code]) * (1 + slip)
                 if not np.isfinite(bp) or bp <= 0:
                     continue
-                alloc = cash * float(buy_weights[j])
+                alloc = available_cash * float(buy_weights[j])
                 shares = int(alloc / bp / 100) * 100
                 if shares <= 0:
                     continue
@@ -122,7 +132,7 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
                     cost = shares * bp * (1 + comm)
                 cash -= cost
                 current_price = bp
-                if use_open_price and code in close_row.index and pd.notna(close_row[code]):
+                if code in close_row.index and pd.notna(close_row[code]):
                     current_price = float(close_row[code])
                 holdings[code] = {
                     "shares": shares,
@@ -130,6 +140,10 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
                     "current_price": current_price,
                     "bought_at_tidx": idx_t,
                 }
+
+        for code in list(holdings.keys()):
+            if code in close_row.index and pd.notna(close_row[code]):
+                holdings[code]["current_price"] = float(close_row[code])
 
         total_value = cash + sum(
             holding["shares"] * holding.get("current_price", holding["buy_price"])
@@ -140,14 +154,15 @@ def backtest_strategy(prices_pivot, predictions_df, config, open_pivot=None):
     return daily_values, all_dates
 
 
-def compute_backtest_metrics(daily_values_df):
+def compute_backtest_metrics(daily_values_df, initial_capital=None):
     if len(daily_values_df) == 0:
         return {}
     df = daily_values_df.copy()
+    df = df.sort_values("date").reset_index(drop=True)
     df["returns"] = df["value"].pct_change()
-    df = df.dropna(subset=["returns"])
 
-    total_return = df["value"].iloc[-1] / df["value"].iloc[0] - 1
+    base_value = float(initial_capital) if initial_capital is not None else df["value"].iloc[0]
+    total_return = df["value"].iloc[-1] / base_value - 1
 
     first_date = df["date"].iloc[0]
     last_date = df["date"].iloc[-1]
@@ -156,7 +171,8 @@ def compute_backtest_metrics(daily_values_df):
     annual_return = (1 + total_return) ** (1.0 / max(years, 1e-6)) - 1
 
     daily_rf = 0.03 / 252
-    excess = df["returns"].values - daily_rf
+    returns = df["returns"].dropna()
+    excess = returns.values - daily_rf
     ann_excess = excess.mean() * 252
     ann_vol = excess.std() * np.sqrt(252)
     sharpe = ann_excess / (ann_vol + 1e-9)
@@ -165,7 +181,7 @@ def compute_backtest_metrics(daily_values_df):
     drawdown = (df["value"] - cummax) / cummax
     max_drawdown = drawdown.min()
 
-    win_rate = (df["returns"] > 0).mean()
+    win_rate = (returns > 0).mean()
 
     return {
         "总收益率": f"{total_return * 100:.2f}%",
@@ -183,11 +199,13 @@ def plot_backtest_curve(
     filename,
     output_dir,
     strategy_label="Strategy",
+    initial_capital=None,
 ):
     fig, axes = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [3, 1]})
 
     ax1 = axes[0]
-    strategy_vals = daily_values_df["value"].values / daily_values_df["value"].values[0]
+    base_value = float(initial_capital) if initial_capital is not None else daily_values_df["value"].values[0]
+    strategy_vals = daily_values_df["value"].values / base_value
     ax1.plot(daily_values_df["date"], strategy_vals, label=strategy_label, color="blue", linewidth=1.5)
 
     if len(benchmark_values) > 0:

@@ -100,36 +100,29 @@ def load_and_clean_daily(basic_df, st_set_by_date, data_base=DATA_BASE):
     panel["vol"] = panel["vol"].astype("float32")
     panel["pct_chg"] = panel["pct_chg"].astype("float32")
 
-    outlier_cols = ["pct_chg", "close", "vol"]
-    panel["_keep"] = True
-    for _, grp in panel.groupby("ts_code", observed=True, sort=False):
-        for col in outlier_cols:
-            vals = grp[col].values.astype("float64")
-            mu = vals.mean()
-            sigma = vals.std()
-            if sigma < 1e-9:
-                continue
-            z = abs(vals - mu) / sigma
-            idx = grp.index[z > 3]
-            panel.loc[idx, "_keep"] = False
-    n_before = len(panel)
-    panel = panel[panel["_keep"]].copy()
-    n_after = len(panel)
-    print(f"  3-sigma outlier filter: {n_before:,} -> {n_after:,} rows ({n_before - n_after:,} removed)")
-    panel.drop(columns=["_keep"], inplace=True)
+    panel = _filter_past_only_outliers(panel, ["pct_chg", "close", "vol"])
 
     gc.collect()
     return panel
 
 
 def select_stock_pool(panel, config):
-    if config["stock_pool"] == "all":
-        stock_counts = panel.groupby("ts_code", observed=True).size()
+    pool_name = config.get("stock_pool", "liquid").lower()
+    pool_end_dt = pd.to_datetime(config.get("pool_end", config["train_end"]))
+
+    if pool_name in {"hs300", "csi300", "000300.sh"}:
+        index_stocks = _select_index_weight_pool(panel, "000300.SH", pool_end_dt, config["max_stocks"])
+        if index_stocks:
+            return index_stocks
+        print("  HS300 index weight data unavailable; falling back to liquid stock pool.")
+
+    if pool_name == "all":
+        pool_panel = panel[panel["trade_date"] <= pool_end_dt]
+        stock_counts = pool_panel.groupby("ts_code", observed=True).size()
         valid_stocks = stock_counts[stock_counts >= config["seq_len"] + 50].index.tolist()
         return valid_stocks[: config["max_stocks"]]
 
     pool_start_dt = pd.to_datetime(config["train_start"]) - timedelta(days=90)
-    pool_end_dt = pd.to_datetime(config["test_end"])
 
     sub = panel[(panel["trade_date"] >= pool_start_dt) & (panel["trade_date"] <= pool_end_dt)].copy()
     if len(sub) == 0:
@@ -143,6 +136,70 @@ def select_stock_pool(panel, config):
     del sub
     gc.collect()
     return sorted_stocks[: config["max_stocks"]]
+
+
+def _select_index_weight_pool(panel, index_code, pool_end_dt, max_stocks, data_base=DATA_BASE):
+    index_dir = os.path.join(data_base, "index_weight")
+    if not os.path.isdir(index_dir):
+        return []
+
+    end_ym = pool_end_dt.strftime("%Y%m")
+    suffix = f"_{index_code}.csv"
+    candidates = sorted(
+        fname
+        for fname in os.listdir(index_dir)
+        if fname.endswith(suffix) and fname.split("_", 1)[0] <= end_ym
+    )
+    if not candidates:
+        return []
+
+    available_codes = set(panel["ts_code"].astype(str).unique())
+    for fname in reversed(candidates):
+        path = os.path.join(index_dir, fname)
+        df = pd.read_csv(path, dtype={"con_code": str})
+        if len(df) == 0 or "con_code" not in df.columns:
+            continue
+        if "weight" in df.columns:
+            df = df.sort_values("weight", ascending=False)
+        codes = []
+        seen = set()
+        for code in df["con_code"].dropna():
+            if code in seen or code not in available_codes:
+                continue
+            seen.add(code)
+            codes.append(code)
+            if len(codes) >= max_stocks:
+                break
+        if codes:
+            print(f"  Loaded {len(codes)} stocks from {fname}")
+            return codes
+
+    return []
+
+
+def _filter_past_only_outliers(panel, outlier_cols, min_periods=252, z_thresh=10.0):
+    panel = panel.sort_values(["ts_code", "trade_date"]).copy()
+    panel["_keep"] = True
+
+    for _, grp in panel.groupby("ts_code", observed=True, sort=False):
+        for col in outlier_cols:
+            s = grp[col].astype("float64")
+            mean = s.expanding(min_periods=min_periods).mean().shift(1)
+            std = s.expanding(min_periods=min_periods).std(ddof=0).shift(1)
+            z = (s - mean).abs() / (std + 1e-9)
+            drop_mask = ((std > 1e-9) & (z > z_thresh)).fillna(False)
+            if drop_mask.any():
+                panel.loc[grp.index[drop_mask.to_numpy()], "_keep"] = False
+
+    n_before = len(panel)
+    panel = panel[panel["_keep"]].copy()
+    n_after = len(panel)
+    print(
+        f"  Past-only outlier filter: {n_before:,} -> {n_after:,} rows "
+        f"({n_before - n_after:,} removed)"
+    )
+    panel.drop(columns=["_keep"], inplace=True)
+    return panel
 
 
 def load_benchmark_data(data_base=DATA_BASE):
@@ -165,4 +222,3 @@ def load_benchmark_data(data_base=DATA_BASE):
         hs300 = bench_panel[bench_panel["ts_code"] == "000300.SH"].sort_values("trade_date")
         return hs300
     return pd.DataFrame()
-

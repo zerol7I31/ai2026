@@ -46,15 +46,13 @@ def compute_direction_accuracy(predictions, labels):
 
 def predict_mlp(model, loader, sequences, device):
     all_preds = []
-    all_labels = []
     with torch.no_grad():
-        for features, labels in loader:
+        for features, _ in loader:
             features = features.to(device)
             preds = model(features).cpu().numpy()
-            labs = labels.cpu().numpy()
             all_preds.extend(preds.tolist())
-            all_labels.extend(labs.tolist())
-    all_dates = [s["date"] for s in sequences]
+    all_labels = [s.get("raw_label", s["label"]) for s in sequences]
+    all_dates = [s.get("trade_date", s["date"]) for s in sequences]
     return np.array(all_preds), np.array(all_labels), all_dates
 
 
@@ -63,18 +61,18 @@ def ensemble_predict_gru(ensemble_models, loader, sequences, device):
     all_labels = []
     all_dates = []
     with torch.no_grad():
-        for features, labels, stock_ids, indices in loader:
+        for features, _, stock_ids, indices in loader:
             features, stock_ids = features.to(device), stock_ids.to(device)
             preds_ensemble = np.zeros(len(features), dtype=np.float64)
             for model in ensemble_models:
                 model.eval()
                 preds_ensemble += model(features, stock_ids).cpu().numpy().astype(np.float64)
             preds_ensemble /= len(ensemble_models)
-            labs = labels.cpu().numpy()
             all_preds.extend(preds_ensemble.tolist())
-            all_labels.extend(labs.tolist())
             for idx in indices.tolist():
-                all_dates.append(sequences[idx]["date"])
+                sequence = sequences[idx]
+                all_labels.append(sequence.get("raw_label", sequence["label"]))
+                all_dates.append(sequence.get("trade_date", sequence["date"]))
     return np.array(all_preds), np.array(all_labels), all_dates
 
 
@@ -94,4 +92,3 @@ def cross_sectional_normalize(preds, dates):
         else:
             df.loc[group.index, "pred_cs_norm"] = (vals - mu) / sigma
     return df["pred_cs_norm"].values
-

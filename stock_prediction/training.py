@@ -97,7 +97,7 @@ def train_mlp_model(model, train_loader, val_loader, save_path, config, output_d
         train_losses,
         val_losses,
         title="MLP Training and Validation Loss",
-        filename="mlp_loss_curve.png",
+        filename="loss_curve.png",
         output_dir=output_dir,
     )
     return train_losses, val_losses
@@ -221,4 +221,3 @@ def _plot_loss_curve(train_losses, val_losses, title, filename, output_dir):
     plt.grid(True, alpha=0.3)
     plt.savefig(os.path.join(output_dir, filename), dpi=150, bbox_inches="tight")
     plt.close()
-
